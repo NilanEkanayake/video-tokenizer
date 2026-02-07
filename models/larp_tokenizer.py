@@ -25,6 +25,666 @@ def get_orig_module(module):
         module = module._orig_mod
     return module
 
+import torch
+import torch.nn as nn
+import numpy as np
+import itertools
+import einops
+# 假设其他依赖项 (models, PatchEmbed3D, get_3d_sincos_pos_embed 等) 在上下文环境中已存在
+
+@register('cosmos_larp_tokenizer_unified')
+class CosmosLARPTokenizerUnified(nn.Module, PyTorchModelHubMixin):
+    output_format = 'bcthw'
+    def __init__(
+        self, 
+        bottleneck,
+        prior_model,
+        # --- Token 数量配置 ---
+        num_latent_tokens=1024,    # 原本是 128+256，现在统一为一个总数
+        
+        # --- 尺寸配置 ---
+        input_size=128,
+        frame_num=16,             # 统一处理的帧数
+        temporal_patch_size=4,    # 时间维度的 Patch Size bottleneck_token_num
+        patch_size=8,
+        decoder_temporal_patch_size=4,
+        decoder_patch_size=8,
+        in_channels=3,
+
+        # --- 模型配置 ---
+        transformer_name='transformer_encoder_parallel',
+        encoder_name=None,
+        decoder_name=None,
+        encoder_hidden_size=768,
+        decoder_hidden_size=768,
+        
+        encoder_num_heads=12,
+        decoder_num_heads=12,
+        encoder_depth=6,
+        decoder_depth=6,
+
+        # --- Embedding 配置 ---
+        latent_pe_scale_factor=10000,
+        query_init_std=0.02,
+        encoder_query_gaussian_init=True,
+        
+        # --- Boolean Flags ---
+        learned_decoder_latent_pe=False,
+        
+        **kwargs
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.input_size = input_size
+        self.frame_num = frame_num 
+        
+        self.num_latent_tokens = num_latent_tokens
+        self.bottleneck_token_num = num_latent_tokens
+
+        self.encoder_hidden_size = encoder_hidden_size
+        self.decoder_hidden_size = decoder_hidden_size
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        
+        self.decoder_patch_size = decoder_patch_size
+        self.decoder_temporal_patch_size = decoder_temporal_patch_size
+
+        # =========================================================
+        # 1. Embedder (统一处理所有帧)
+        # =========================================================
+        self.token_h = self.token_w = input_size // patch_size
+        
+        assert frame_num % temporal_patch_size == 0, "frame_num must be divisible by temporal_patch_size"
+        
+        # 统一的 3D Patch Embedder
+        self.x_embedder = PatchEmbed3D(
+            input_size, frame_num, patch_size, temporal_patch_size, in_channels, encoder_hidden_size, bias=True
+        )
+        
+        self.token_t = self.x_embedder.num_temporal_patches
+        self.num_patches = self.x_embedder.num_spatial_patches * self.x_embedder.num_temporal_patches
+
+        # Encoder Patch PE
+        self.register_buffer('encoder_patch_pe', torch.zeros(1, self.num_patches, encoder_hidden_size))
+        self.get_encoder_patch_pe = lambda: self.encoder_patch_pe
+
+        # Encoder Latent Queries (Learnable Queries for Perceiver IO)
+        self.encoder_latent_query_embed = nn.Parameter(torch.zeros(num_latent_tokens, encoder_hidden_size), requires_grad=True)
+        self.encoder_query = lambda: self.encoder_latent_query_embed.unsqueeze(0)
+        
+        # Init Latent Queries
+        query_embed = torch.randn(self.num_latent_tokens, self.encoder_hidden_size) * query_init_std
+        self.encoder_latent_query_embed.data.copy_(query_embed)
+
+        # =========================================================
+        # 2. Encoder & Decoder Models
+        # =========================================================
+        if encoder_name is None or encoder_name.lower() in ['none', 'no', 'null', '']:
+            encoder_name = transformer_name
+        if decoder_name is None or decoder_name.lower() in ['none', 'no', 'null', '']:
+            decoder_name = transformer_name
+
+        encoder_args = {
+            'name': encoder_name,
+            'args': {
+                'dim': encoder_hidden_size,
+                'depth': encoder_depth,
+                'n_head': encoder_num_heads,
+                'head_dim': encoder_hidden_size // encoder_num_heads,
+            },
+        }
+        self.encoder = models.make(encoder_args)
+
+        # 瓶颈层 (VQ)
+        self.bottleneck_dim = bottleneck['args']['bottleneck_dim']
+        bottleneck_args = {
+            'token_nums': self.bottleneck_token_num, 
+            'input_dim': encoder_hidden_size, 
+            'output_dim': decoder_hidden_size
+        }
+        self.bottleneck = models.make(bottleneck, args=bottleneck_args)
+        self.codebook_size = bottleneck['args']['regularizer']['args']['codebook_size']
+
+        decoder_args = {
+            'name': decoder_name,
+            'args': {
+                'dim': decoder_hidden_size,
+                'depth': decoder_depth,
+                'n_head': decoder_num_heads,
+                'head_dim': decoder_hidden_size // decoder_num_heads,
+            }, 
+        }
+        self.decoder = models.make(decoder_args)
+
+        # =========================================================
+        # 3. Output Layer & Decoder Embeddings
+        # =========================================================
+        self.final_layer = OutputLayer(decoder_hidden_size, decoder_temporal_patch_size, decoder_patch_size, self.out_channels)
+
+        # 计算 Decoder 需要恢复的 patch 数量
+        recon_t = frame_num // decoder_temporal_patch_size
+        recon_hw = (input_size // decoder_patch_size)**2
+        
+        # Decoder Spatial-Temporal Query Embeddings (用于告知 Decoder 每个位置是哪里)
+        self.register_buffer('decoder_patch_query_embed', torch.zeros(1, recon_t * recon_hw, decoder_hidden_size))
+        self.get_decoder_patch_query_embed_raw = lambda: self.decoder_patch_query_embed
+        self.decoder_patch_query_token_type_embed = nn.Parameter(torch.zeros(1, 1, decoder_hidden_size), requires_grad=True)
+        self.get_decoder_patch_query_embed = lambda: self.get_decoder_patch_query_embed_raw() + self.decoder_patch_query_token_type_embed
+
+        # Decoder Latent PE (加在 Latent Codes 上)
+        self.learned_decoder_latent_pe = learned_decoder_latent_pe
+        self.register_buffer('decoder_latent_pe', torch.zeros(1, self.num_latent_tokens, decoder_hidden_size))
+        self.get_decoder_latent_pe = lambda: self.decoder_latent_pe
+
+        self.prior_model = None 
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # 1. Encoder Positional Embeddings (3D Sincos)
+        encoder_pos_embed = get_3d_sincos_pos_embed(self.encoder_hidden_size, self.token_h, self.token_t)
+        self.encoder_patch_pe.data.copy_(torch.from_numpy(encoder_pos_embed).float().reshape_as(self.encoder_patch_pe))
+
+        # 2. Decoder Latent Embeddings (1D Sincos for latents)
+        decoder_token_embed = get_1d_sincos_pos_embed_from_grid(self.decoder_hidden_size, np.arange(self.num_latent_tokens), 10000)
+        decoder_token_embed = torch.from_numpy(decoder_token_embed).float().reshape(1, self.num_latent_tokens, self.decoder_hidden_size)
+        self.decoder_latent_pe.data.copy_(decoder_token_embed)
+
+        # 3. Decoder Query Embeddings (3D Sincos for output grid)
+        decoder_pos_embed = get_3d_sincos_pos_embed(self.decoder_hidden_size, self.token_h, self.token_t) # Assuming decode dim matches
+        self.decoder_patch_query_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().reshape_as(self.decoder_patch_query_embed))
+        
+        decoder_patch_query_token_type_embed = torch.randn(1, 1, self.decoder_hidden_size) * .02
+        self.decoder_patch_query_token_type_embed.data.copy_(decoder_patch_query_token_type_embed)
+
+        # 4. Patch Embedder Projections
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # 5. Output Layer
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def decoder_parameters(self):
+        decoder_params = itertools.chain(
+            self.decoder.parameters(),
+            self.final_layer.parameters(),
+            [self.decoder_patch_query_token_type_embed],
+        )
+        return decoder_params
+
+    def decoder_requires_grad_(self, requires_grad):
+        for param in self.decoder_parameters():
+            param.requires_grad_(requires_grad)
+
+    def others_parameters(self):
+        decoder_params_set = set(self.decoder_parameters())
+        return (p for p in self.parameters() if p not in decoder_params_set)
+
+    def others_requires_grad_(self, requires_grad):
+        for param in self.others_parameters():
+            param.requires_grad_(requires_grad)
+
+    def encode(self, x):
+        # x: [B, C, T, H, W] (例如 [B, 3, 16, 128, 128])
+        B = x.shape[0]
+        
+        # 1. Patch Embed
+        # [B, N_patch, D]
+        feat = self.x_embedder(x) + self.get_encoder_patch_pe() 
+        
+        # 2. Prepare Latent Queries
+        # [B, N_latent, D]
+        q = self.encoder_query().expand(B, -1, -1) 
+        
+        # 3. Encoder (Perceiver IO: Cross Attn -> Self Attn layers)
+        # [B, N_latent, D]
+        z = self.encoder(feat, q) 
+
+        # 4. VQ Bottleneck
+        bottleneck_out = self.bottleneck(z)
+        z_quantized = bottleneck_out.pop('output') # [B, N_latent, D]
+
+        return {
+            'encoded': z_quantized, 
+            **bottleneck_out
+        }
+
+    def unpatchify(self, x):
+        """
+        x: (b, n, t_patch_size * s_patch_size**2 * c)
+        videos: (b, c, t, h, w)
+        注意：这里的 n = t_patches * h_patches * w_patches
+        """
+        c = self.out_channels
+        pt = self.decoder_temporal_patch_size # 使用 decoder 的配置
+        p = self.decoder_patch_size
+        h = w = self.token_h # 假设输入输出空间尺寸一致
+        
+        # 计算时间维度的 patch 数
+        # n = t_grid * h_grid * w_grid
+        t_grid = x.size(1) // (h * w)
+
+        x = x.reshape(-1, t_grid, h, w, pt, p, p, c)
+        # 重新排列为视频格式: [b, c, t, h, w]
+        x = einops.rearrange(x, 'b t h w pt p1 p2 c -> b c (t pt) (h p1) (w p2)')
+        return x
+
+    def decode(self, z):
+        # z: [B, N_latent, D] (Quantized Latent)
+        B = z.shape[0]
+
+        # 1. Add Decoder Latent Positional Embedding
+        decoder_token_embed = self.get_decoder_latent_pe()
+        z = z + decoder_token_embed 
+
+        # 2. Prepare Decoder Spatial-Temporal Queries (Target Grid)
+        # [B, N_grid, D]
+        decoder_pos_embed = self.get_decoder_patch_query_embed().expand(B, -1, -1)
+        
+        # 3. Decoder (Perceiver IO or Transformer Decoder)
+        # Cross attend latent z to grid decoder_pos_embed
+        out = self.decoder(z, decoder_pos_embed)
+        
+        # 4. Final Projection
+        out = self.final_layer(out)
+        
+        # 5. Unpatchify to Video
+        pred_video = self.unpatchify(out)
+
+        return pred_video
+
+    def forward(self, data, **kwargs):
+        # data: [B, C, Frame_Num, H, W]
+        encode_output = self.encode(data)
+        pred_frames = self.decode(encode_output['encoded']).contiguous()
+        
+        return_dict = {'pred_frames': pred_frames, **encode_output}
+        return return_dict
+
+
+
+
+
+class TokenInteractionLayer(nn.Module):
+    """
+    专门用于两组 Token 之间的 Cross Attention 交互
+    Query: Rest Tokens (256)
+    Key/Value: First Frame Tokens (128)
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, x, context):
+        # x: [B, N_rest, C] -> Queries
+        # context: [B, N_first, C] -> Keys, Values
+        
+        # 1. Cross Attention
+        residual = x
+        x = self.norm(x)
+        # attn_output, _ = self.cross_attn(query=x, key=context, value=context)
+        # 现在的 PyTorch MultiheadAttention batch_first=True 输入为 (B, L, E)
+        attn_output, _ = self.cross_attn(x, context, context)
+        x = residual + attn_output
+        
+        # 2. FFN
+        residual = x
+        x = self.norm_ffn(x)
+        x = self.ffn(x)
+        x = residual + x
+        return x
+
+
+
+@register('cosmos_larp_tokenizer')
+class CosmosLARPTokenizer(nn.Module, PyTorchModelHubMixin):
+    output_format = 'bcthw'
+    def __init__(
+        self, 
+        bottleneck,
+        prior_model,
+        # --- Token 数量配置 ---
+        token_num_first=128,      # 第一帧的 Token 数
+        token_num_rest=256,       # 后续帧的 Token 数
+        
+        # --- 尺寸配置 ---
+        input_size=128,
+        frame_num=16,             # 总帧数 1+16
+        temporal_patch_size=4,    # 仅用于后续帧
+        patch_size=8,
+        decoder_temporal_patch_size=4,
+        decoder_patch_size=8,
+        in_channels=3,
+
+        # --- 模型配置 ---
+        transformer_name='transformer_encoder_parallel',
+        encoder_name=None,
+        decoder_name=None,
+        encoder_hidden_size=768,
+        decoder_hidden_size=768,
+        
+        # 为了简化演示，这里假设 encoder/decoder 参数大部分共享配置
+        encoder_num_heads=12,
+        decoder_num_heads=12,
+        encoder_depth=6,
+        decoder_depth=6,
+
+        # --- Embedding 配置 ---
+        latent_pe_scale_factor=10000,
+        query_init_std=0.02,
+        encoder_query_gaussian_init=True,
+        
+        # --- Boolean Flags ---
+        learned_encoder_patch_pe=False,
+        learned_encoder_latent_query_embed=True,
+        learned_decoder_latent_pe=False,
+        learned_decoder_patch_query_embed=False,
+        
+        # 忽略部分复杂 flag 以简化代码...
+        **kwargs
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.input_size = input_size
+        self.frame_num = frame_num # 应为 17
+        
+        self.token_num_first = token_num_first
+        self.token_num_rest = token_num_rest
+        self.bottleneck_token_num = token_num_first + token_num_rest # 总 Codebook 索引数
+
+        self.encoder_hidden_size = encoder_hidden_size
+        self.decoder_hidden_size = decoder_hidden_size
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size # 针对 rest frames
+        
+        self.decoder_patch_size = decoder_patch_size
+        self.decoder_temporal_patch_size = decoder_temporal_patch_size
+
+        # =========================================================
+        # 1. Embedders (切片层)
+        # =========================================================
+        self.token_h =self.token_w =token_h=token_w = input_size // patch_size
+        # A. 第一帧 Embedder (T=1, 使用 2D 逻辑或 3D T=1)
+        # 这里强制 temporal_patch_size=1 因为只有一帧
+        self.x_embedder_first = PatchEmbed3D(
+            input_size, 4, patch_size, temporal_patch_size, in_channels, encoder_hidden_size, bias=True
+        )
+        # B. 后续帧 Embedder (T=16)
+        print("Frame num:", frame_num)
+        rest_frames = frame_num - 4
+        print("Rest frames:", rest_frames)
+        print("Temporal patch size:", temporal_patch_size)
+        assert rest_frames % temporal_patch_size == 0
+        self.x_embedder_rest = PatchEmbed3D(
+            input_size, rest_frames, patch_size, temporal_patch_size, in_channels, encoder_hidden_size, bias=True
+        )
+        self.token_t_first = token_t_first = self.x_embedder_first.num_temporal_patches
+        self.token_t_rest = token_t_rest = self.x_embedder_rest.num_temporal_patches
+        # 计算 Patch 数量用于 PE
+        self.num_patches_first = self.x_embedder_first.num_spatial_patches*self.x_embedder_first.num_temporal_patches
+        self.num_patches_rest = self.x_embedder_rest.num_spatial_patches * self.x_embedder_rest.num_temporal_patches
+
+        self.register_buffer('encoder_patch_pe_first', torch.zeros(1, self.num_patches_first, encoder_hidden_size))
+        self.get_encoder_patch_pe_raw_first = lambda: self.encoder_patch_pe_first
+        self.get_encoder_patch_pe_first = self.get_encoder_patch_pe_raw_first
+        self.register_buffer('encoder_patch_pe_rest', torch.zeros(1, self.num_patches_rest, encoder_hidden_size))
+        self.get_encoder_patch_pe_raw_rest = lambda: self.encoder_patch_pe_rest
+        self.get_encoder_patch_pe_rest = self.get_encoder_patch_pe_raw_rest
+
+
+        self.encoder_latent_query_embed_first = nn.Parameter(torch.zeros(token_num_first, encoder_hidden_size), requires_grad=True)
+        self.encoder_query_first = lambda: self.encoder_latent_query_embed_first.unsqueeze(0)
+        self.encoder_latent_query_embed_rest = nn.Parameter(torch.zeros(token_num_rest, encoder_hidden_size), requires_grad=True)
+        self.encoder_query_rest = lambda: self.encoder_latent_query_embed_rest.unsqueeze(0)
+        query_embed_first = torch.randn(self.token_num_first, self.encoder_hidden_size) * query_init_std
+        self.encoder_latent_query_embed_first.data.copy_(query_embed_first)
+
+        query_embed_rest = torch.randn(self.token_num_rest, self.encoder_hidden_size) * query_init_std
+        self.encoder_latent_query_embed_rest.data.copy_(query_embed_rest)
+
+
+        decoder_h = input_size // decoder_patch_size
+        decoder_w = input_size // decoder_patch_size
+        # 编码器：可以使用同一个 Transformer 权重处理两组数据（只要 Dim 相同），也可以分开。
+        # 这里为了节省显存，使用共享权重的 Encoder (Perceiver IO 结构)
+        if encoder_name is None or encoder_name.lower() in ['none', 'no', 'null', '']:
+            encoder_name = transformer_name
+        if decoder_name is None or decoder_name.lower() in ['none', 'no', 'null', '']:
+            decoder_name = transformer_name
+
+        encoder_args = {
+            'name': encoder_name,
+            'args': {
+                'dim': encoder_hidden_size,
+                'depth': encoder_depth,
+                'n_head': encoder_num_heads,
+                'head_dim': encoder_hidden_size // encoder_num_heads,
+            }, # the args can be redundant, but redundant args will be filtered out in models.make
+        }
+        self.encoder_first = models.make(encoder_args)
+        self.encoder_rest = models.make(encoder_args)
+        #self.decoder = models.make(decoder_args)
+
+        # 瓶颈层 (VQ)
+        self.bottleneck_dim = bottleneck['args']['bottleneck_dim']
+        bottleneck_args = {
+            'token_nums': self.bottleneck_token_num, # 128 + 256
+            'input_dim': encoder_hidden_size, 
+            'output_dim': decoder_hidden_size
+        }
+        self.bottleneck = models.make(bottleneck, args=bottleneck_args)
+        self.codebook_size = bottleneck['args']['regularizer']['args']['codebook_size']
+
+        # 交互层：Rest Tokens -> First Tokens
+        self.interaction_layer = TokenInteractionLayer(decoder_hidden_size, num_heads=decoder_num_heads)
+        decoder_args = {
+            'name': decoder_name,
+            'args': {
+                'dim': decoder_hidden_size,
+                'depth': decoder_depth,
+                'n_head': decoder_num_heads,
+                'head_dim': decoder_hidden_size // decoder_num_heads,
+            }, # the args can be redundant, but redundant args will be filtered out in models.make
+        }
+        self.decoder_first = models.make(decoder_args)
+        self.decoder_rest = models.make(decoder_args)
+
+        self.final_layer_rest = OutputLayer(decoder_hidden_size, decoder_temporal_patch_size, decoder_patch_size, self.out_channels)
+        self.final_layer_first = OutputLayer(decoder_hidden_size, decoder_temporal_patch_size, decoder_patch_size, self.out_channels)
+
+        recon_t_rest = rest_frames // decoder_temporal_patch_size
+        recon_hw_rest = (input_size // decoder_patch_size)**2
+
+        self.register_buffer('decoder_patch_query_embed_first', torch.zeros(1, 1 * recon_hw_rest, decoder_hidden_size))
+        self.get_decoder_patch_query_embed_raw_first = lambda: self.decoder_patch_query_embed_first
+        self.decoder_patch_query_token_type_embed_first = nn.Parameter(torch.zeros(1, 1, decoder_hidden_size), requires_grad=True)
+        self.get_decoder_patch_query_embed_first = lambda: self.get_decoder_patch_query_embed_raw_first() + self.decoder_patch_query_token_type_embed_first
+
+
+        self.register_buffer('decoder_patch_query_embed_rest', torch.zeros(1, recon_t_rest * recon_hw_rest, decoder_hidden_size))
+        self.get_decoder_patch_query_embed_raw_rest = lambda: self.decoder_patch_query_embed_rest
+        self.decoder_patch_query_token_type_embed_rest = nn.Parameter(torch.zeros(1, 1, decoder_hidden_size), requires_grad=True)
+        self.get_decoder_patch_query_embed_rest= lambda: self.get_decoder_patch_query_embed_raw_rest() + self.decoder_patch_query_token_type_embed_rest
+
+
+        # decoder latent PE
+        self.learned_decoder_latent_pe = learned_decoder_latent_pe
+
+        self.register_buffer('decoder_latent_pe_first', torch.zeros(1, self.token_num_first, decoder_hidden_size))
+        self.get_decoder_latent_pe_first = lambda: self.decoder_latent_pe_first
+
+
+        self.register_buffer('decoder_latent_pe_rest', torch.zeros(1, self.token_num_rest, decoder_hidden_size))
+        self.get_decoder_latent_pe_rest = lambda: self.decoder_latent_pe_rest
+
+        self.prior_model = None 
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+        token_h, token_w = self.token_h, self.token_w
+
+        encoder_pos_embed_first = get_3d_sincos_pos_embed(self.encoder_hidden_size, token_h, self.token_t_first)
+        self.encoder_patch_pe_first.data.copy_(torch.from_numpy(encoder_pos_embed_first).float().reshape_as(self.encoder_patch_pe_first))
+
+        encoder_pos_embed_rest = get_3d_sincos_pos_embed(self.encoder_hidden_size, token_h, self.token_t_rest)
+        self.encoder_patch_pe_rest.data.copy_(torch.from_numpy(encoder_pos_embed_rest).float().reshape_as(self.encoder_patch_pe_rest))
+
+
+
+        decoder_token_embed_first = get_1d_sincos_pos_embed_from_grid(self.decoder_hidden_size, np.arange(self.token_num_first), 10000)
+        decoder_token_embed_first = torch.from_numpy(decoder_token_embed_first).float().reshape(1, self.token_num_first, self.decoder_hidden_size)
+        self.decoder_latent_pe_first.data.copy_(decoder_token_embed_first)
+        decoder_token_embed_rest = get_1d_sincos_pos_embed_from_grid(self.decoder_hidden_size, np.arange(self.token_num_rest), 10000)
+        decoder_token_embed_rest = torch.from_numpy(decoder_token_embed_rest).float().reshape(1, self.token_num_rest, self.decoder_hidden_size)
+        self.decoder_latent_pe_rest.data.copy_(decoder_token_embed_rest)
+
+        decoder_pos_embed_first = get_3d_sincos_pos_embed(self.decoder_hidden_size, self.token_h, self.token_t_first)
+        self.decoder_patch_query_embed_first.data.copy_(torch.from_numpy(decoder_pos_embed_first).float().reshape_as(self.decoder_patch_query_embed_first))
+        decoder_patch_query_token_type_embed_first = torch.randn(1, 1, self.decoder_hidden_size) * .02
+        self.decoder_patch_query_token_type_embed_first.data.copy_(decoder_patch_query_token_type_embed_first)
+
+        decoder_pos_embed_rest = get_3d_sincos_pos_embed(self.decoder_hidden_size, self.token_h, self.token_t_rest)
+        self.decoder_patch_query_embed_rest.data.copy_(torch.from_numpy(decoder_pos_embed_rest).float().reshape_as(self.decoder_patch_query_embed_rest))
+        decoder_patch_query_token_type_embed_rest = torch.randn(1, 1, self.decoder_hidden_size) * .02
+        self.decoder_patch_query_token_type_embed_rest.data.copy_(decoder_patch_query_token_type_embed_rest)
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder_first.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder_first.proj.bias, 0)
+
+        w1 = self.x_embedder_rest.proj.weight.data
+        nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
+        nn.init.constant_(self.x_embedder_rest.proj.bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer_first.linear.weight, 0)
+        nn.init.constant_(self.final_layer_first.linear.bias, 0)
+        nn.init.constant_(self.final_layer_rest.linear.weight, 0)
+        nn.init.constant_(self.final_layer_rest.linear.bias, 0)
+    def decoder_parameters(self):
+        decoder_params = itertools.chain(
+            self.decoder_first.parameters(),
+            self.decoder_rest.parameters(),
+            self.final_layer_first.parameters(),
+            self.final_layer_rest.parameters(),
+            self.decoder_patch_query_token_type_embed_first, 
+            self.decoder_patch_query_token_type_embed_rest,
+            self.interaction_layer.parameters(),
+        )
+        return decoder_params
+
+    def decoder_requires_grad_(self, requires_grad):
+        for param in self.decoder_parameters():
+            param.requires_grad_(requires_grad)
+
+    def others_parameters(self):
+        decoder_params_set = set(self.decoder_parameters())
+        return (p for p in self.parameters() if p not in decoder_params_set)
+
+    def others_requires_grad_(self, requires_grad):
+        for param in self.others_parameters():
+            param.requires_grad_(requires_grad)
+    def encode(self, x):
+        B = x.shape[0]
+        x_first = x[:, :, 0:4, :, :]  # [B, C, 1, H, W]
+        x_rest = x[:, :, 4:, :, :]   
+        feat_first = self.x_embedder_first(x_first) + self.get_encoder_patch_pe_first() # [B, N_patch_1, D]
+        feat_rest = self.x_embedder_rest(x_rest) + self.get_encoder_patch_pe_rest()    # [B, N_patch_rest, D]
+        q_first = self.encoder_query_first().expand(B, -1, -1) # [B, 128, D]
+        q_rest = self.encoder_query_rest().expand(B, -1, -1)   # [B, 256, D]
+        z_first = self.encoder_first(feat_first, q_first) # [B, 128, D]
+        z_rest = self.encoder_rest(feat_rest, q_rest)    # [B, 256, D]
+
+        # 4. Concatenate for Bottleneck
+        z_combined = torch.cat([z_first, z_rest], dim=1) # [B, 384, D]
+
+        # 5. VQ Bottleneck
+        bottleneck_out = self.bottleneck(z_combined)
+        z_quantized = bottleneck_out.pop('output') # [B, 384, D]
+
+        return {
+            'encoded': z_quantized, 
+            **bottleneck_out
+        }
+
+    def unpatchify(self, x):
+        """
+        x: (b, n, t_patch_size * s_patch_size**2 * c)
+        videos: (b, c, t, h, w)
+        """
+        c = self.out_channels
+        pt = self.temporal_patch_size
+        p = self.patch_size
+        h = w = self.token_h
+        t = x.size(1) // (h * w)
+
+        x = x.reshape(-1, t, h, w, pt, p, p, c)
+        x = einops.rearrange(x, 'b t h w pt p1 p2 c -> b c (t pt) (h p1) (w p2)')
+        return x
+
+    def decode(self, z):
+        # z: [B, 384, D] (Quantized Latent)
+        B = z.shape[0]
+
+        # 1. Split Latent back
+        z_first = z[:, :self.token_num_first, :] # [B, 128, D]
+        z_rest = z[:, self.token_num_first:, :]  # [B, 256, D]
+        z_rest = self.interaction_layer(x=z_rest, context=z_first)
+        decoder_token_embed_first = self.get_decoder_latent_pe_first()
+        z_first = z_first + decoder_token_embed_first 
+        decoder_pos_embed_first = self.get_decoder_patch_query_embed_first().expand(B, -1, -1)
+        out_first = self.decoder_first(z_first, decoder_pos_embed_first)
+        out_first = self.final_layer_first(out_first)
+        out_first = self.unpatchify(out_first)
+
+        decoder_token_embed_rest = self.get_decoder_latent_pe_rest()
+        z_rest = z_rest + decoder_token_embed_rest 
+        decoder_pos_embed_rest = self.get_decoder_patch_query_embed_rest().expand(B, -1, -1)
+        out_rest = self.decoder_rest(z_rest, decoder_pos_embed_rest)
+        out_rest = self.final_layer_rest(out_rest)
+        out_rest = self.unpatchify(out_rest)
+
+        # 5. Final Concatenation
+        pred_video = torch.cat([out_first, out_rest], dim=2)
+
+        return pred_video
+    def forward(self, data, **kwargs):
+        # data: [B, C, 17, H, W]
+        encode_output = self.encode(data)
+        pred_frames = self.decode(encode_output['encoded']).contiguous()
+        
+        return_dict = {'pred_frames': pred_frames, **encode_output}
+        return return_dict
+
+
+
+
+
 
 class OutputLayer(nn.Module):
     def __init__(self, hidden_size, temporal_patch_size, patch_size, out_channels):
@@ -132,7 +792,7 @@ class LARPTokenizer(nn.Module, PyTorchModelHubMixin):
         else:
             self.get_encoder_patch_pe = self.get_encoder_patch_pe_raw
 
-        # encoder latent query embed
+        # encoder latent query embed        learned_encoder_latent_query_embed: true
         self.learned_encoder_latent_query_embed = learned_encoder_latent_query_embed
         self.encoder_query_gaussian_init = encoder_query_gaussian_init
         if self.learned_encoder_latent_query_embed:
@@ -216,25 +876,25 @@ class LARPTokenizer(nn.Module, PyTorchModelHubMixin):
 
         # Build prior model
         prior_model = edict(prior_model)
-        if prior_model.get('name', '').lower() in ['none', 'no', 'null', '']:
-            self.prior_model = None
-        else:
-            prior_model_additional_args = {'n_ind': self.bottleneck_dim, 'n_classes': self.codebook_size}
-            if prior_model.get('no_dropout', False):
-                prior_model_additional_args['embd_pdrop'] = 0.0
-                prior_model_additional_args['resid_pdrop'] = 0.0
-                prior_model_additional_args['attn_pdrop'] = 0.0
-                print(f"Warning: prior_loss is using no dropout")
+        # if prior_model.get('name', '').lower() in ['none', 'no', 'null', '']:
+        self.prior_model = None
+        # else:
+        #     prior_model_additional_args = {'n_ind': self.bottleneck_dim, 'n_classes': self.codebook_size}
+        #     if prior_model.get('no_dropout', False):
+        #         prior_model_additional_args['embd_pdrop'] = 0.0
+        #         prior_model_additional_args['resid_pdrop'] = 0.0
+        #         prior_model_additional_args['attn_pdrop'] = 0.0
+        #         print(f"Warning: prior_loss is using no dropout")
 
 
-            self.prior_model = models.make(prior_model, args=prior_model_additional_args)
-            self.prior_n_rounds = prior_model.n_rounds
-            self.prior_no_grad_before_last_round = prior_model.no_grad_before_last_round
-            self.prior_avg_loss_over_rounds = prior_model.avg_loss_over_rounds
-            self.use_mix_ss = prior_model.use_mix_ss
-            self.mix_ss_max_ratio = prior_model.mix_ss_max_ratio
-            self.mix_ss_peak_steps_ratio = prior_model.mix_ss_peak_steps_ratio
-            self.prior_latent_ce_temperature = prior_model.latent_ce_temperature
+        #     self.prior_model = models.make(prior_model, args=prior_model_additional_args)
+        #     self.prior_n_rounds = prior_model.n_rounds
+        #     self.prior_no_grad_before_last_round = prior_model.no_grad_before_last_round
+        #     self.prior_avg_loss_over_rounds = prior_model.avg_loss_over_rounds
+        #     self.use_mix_ss = prior_model.use_mix_ss
+        #     self.mix_ss_max_ratio = prior_model.mix_ss_max_ratio
+        #     self.mix_ss_peak_steps_ratio = prior_model.mix_ss_peak_steps_ratio
+        #     self.prior_latent_ce_temperature = prior_model.latent_ce_temperature
         
         self.initialize_weights()
 
@@ -392,6 +1052,7 @@ class LARPTokenizer(nn.Module, PyTorchModelHubMixin):
 
     def encode(self, x):
         x = self.x_embedder(x) + self.get_encoder_patch_pe() # (b, n, d)
+        #print("x_embedder output shape:", x.shape)
         b = x.shape[0]
         q_emb = self.get_encoder_latent_query_embed().repeat(b, 1, 1) # (b, n, d)
         z = self.encoder(x, q_emb)
@@ -568,3 +1229,216 @@ class LARPTokenizer(nn.Module, PyTorchModelHubMixin):
             logits_all_rounds = torch.stack([logits_all_rounds[-1]], dim=0) # (1, b, n - 1, codebook_size)
 
         return logits_all_rounds, ar_pred_cont, next_ar_input # here the next_ar_input is actually the last round's ar_input
+
+def test_cosmos_larp_tokenizer():
+    input_size = 128
+    # 注意：这里 frame_num 必须是 1 + (N * temporal_patch_size)
+    # 例如：1 (首帧) + 16 (后续帧，能被4整除) = 17 帧
+    frame_num = 16
+    token_num_first = 128
+    token_num_rest = 256
+    total_tokens = token_num_first + token_num_rest # 384
+    
+    # 1. Translate YAML config to Python Dict
+    config = {
+        'bottleneck': {
+            'name': 'bottleneck',
+            'args': {
+                'bottleneck_dim': 16,
+                'norm': 'none',
+                'regularizer': {
+                    'name': 'vq',
+                    'args': {
+                        'codebook_size': 8192,
+                        'commitment_loss_weight': 0.25,
+                        'codebook_loss_weight': 1.0,
+                        'entropy_loss_weight': 0.0,
+                        'entropy_loss_temperature': 0.01,
+                        'l2_normalized': True,
+                        'stochastic': True,
+                        'stochastic_temperature': 0.03
+                    }
+                }
+            }
+        },
+        'prior_model': {'name': 'no'},
+        
+        # Cosmos 特有的配置
+        'token_num_first': token_num_first,
+        'token_num_rest': token_num_rest,
+        
+        'transformer_name': 'transformer_encoder_parallel',
+        'encoder_name': 'none',
+        'decoder_name': 'none',
+        
+        # 虽然类内部会重新计算，但保持一致是个好习惯
+        'bottleneck_token_num': total_tokens, 
+        
+        'input_size': input_size,
+        'frame_num': frame_num,
+        'temporal_patch_size': 4, # 仅作用于后续的 16 帧
+        'patch_size': 8,
+        'decoder_temporal_patch_size': 4,
+        'decoder_patch_size': 8,
+        'in_channels': 3,
+        'encoder_hidden_size': 768,
+        'decoder_hidden_size': 768,
+        'encoder_num_heads': 12,
+        'decoder_num_heads': 12,
+        'encoder_depth': 6,  # 测试时稍微改小一点深度，跑得快
+        'decoder_depth': 6,
+        
+        'learned_encoder_patch_pe': False,
+        'learned_encoder_latent_query_embed': True,
+        'learned_decoder_latent_pe': False,
+        'learned_decoder_patch_query_embed': False,
+        
+        # 'use_encoder_latent_query_token_type_embed': True, # 启用我们新加的特性
+        # 'use_decoder_latent_token_type_embed': True,       # 启用我们新加的特性
+        
+        'encoder_query_gaussian_init': True,
+        'latent_pe_scale_factor': 10000,
+        'query_init_std': 0.02
+    }
+
+    # 2. Instantiate Model
+    print(f"Initializing CosmosLARPTokenizer with {frame_num} frames...")
+    print(f"Structure: 1 Frame ({token_num_first} tokens) + {frame_num-1} Frames ({token_num_rest} tokens)")
+    
+    # 假设你已经定义了 CosmosLARPTokenizer 类
+    model = CosmosLARPTokenizer(**config)
+    
+    # 移动到 GPU 如果可用
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    print(f"Model moved to {device}")
+
+    # 3. Create dummy input: (Batch, Channels, Time, Height, Width)
+    # 注意这里 Time = 17
+    dummy_input = torch.randn(1, 3, frame_num, input_size, input_size).to(device)
+    print(f"Input shape: {dummy_input.shape}")
+
+    # 4. Run Forward
+    print("Running forward pass...")
+    with torch.no_grad(): # 测试不需要梯度
+        output = model(dummy_input)
+
+    # 5. Assertions and Checks
+    pred_frames = output['pred_frames']
+    print(f"Prediction shape: {pred_frames.shape}")
+    
+    # Check 1: Input/Output Resolution match
+    assert pred_frames.shape == dummy_input.shape, \
+        f"Shape mismatch! Input {dummy_input.shape}, Output {pred_frames.shape}"
+    
+    # Check 2: Total Bottleneck Token Count (128 + 256 = 384)
+    encoded_z = output['encoded'] # Should be (B, N_total, D)
+    print(f"Encoded shape: {encoded_z.shape}")
+    assert encoded_z.shape[1] == total_tokens, \
+        f"Expected {total_tokens} tokens (128+256), got {encoded_z.shape[1]}"
+
+    # Check 3: Check Codebook Indices
+    indices = output['bottleneck_rep']
+    print(f"Codebook indices shape: {indices.shape}")
+    assert indices.shape == (1, total_tokens)
+    
+    # Check 4: Check if Interaction Layer works (Implicit check via forward success)
+    # 如果 Interaction Layer 维度对不上，Forward 过程中就会报错
+    
+    print("\n✅ Test Passed: CosmosLARPTokenizer (First/Rest Split) initialized and ran successfully.")
+
+if __name__ == "__main__":
+    test_cosmos_larp_tokenizer()
+
+# def test_larp_tokenizer():
+#     input_size = 128
+#     frame_num = 16
+    
+#     # 1. Translate YAML config to Python Dict
+#     config = {
+#         'bottleneck': {
+#             'name': 'bottleneck',
+#             'args': {
+#                 'bottleneck_dim': 16,
+#                 'norm': 'none',
+#                 'regularizer': {
+#                     'name': 'vq',
+#                     'args': {
+#                         'codebook_size': 8192,
+#                         'commitment_loss_weight': 0.25,
+#                         'codebook_loss_weight': 1.0,
+#                         'entropy_loss_weight': 0.0,
+#                         'entropy_loss_temperature': 0.01,
+#                         'l2_normalized': True,
+#                         'stochastic': True,
+#                         'stochastic_temperature': 0.03
+#                     }
+#                 }
+#             }
+#         },
+#         'prior_model': {'name': 'no'},
+#         'transformer_name': 'transformer_encoder_parallel',
+#         'encoder_name': 'none',
+#         'decoder_name': 'none',
+#         'bottleneck_token_num': 1024,
+#         'input_size': input_size,
+#         'frame_num': frame_num,
+#         'temporal_patch_size': 4,
+#         'patch_size': 8,
+#         'decoder_temporal_patch_size': 4,
+#         'decoder_patch_size': 8,
+#         'in_channels': 3,
+#         'encoder_hidden_size': 768,
+#         'decoder_hidden_size': 768,
+#         'encoder_num_heads': 12,
+#         'decoder_num_heads': 12,
+#         'encoder_depth': 12,
+#         'decoder_depth': 12,
+#         'learned_encoder_patch_pe': False,
+#         'learned_encoder_latent_query_embed': True,
+#         'learned_decoder_latent_pe': False,
+#         'learned_decoder_patch_query_embed': False,
+#         'use_encoder_patch_token_type_embed': False,
+#         'use_encoder_latent_query_token_type_embed': False,
+#         'use_decoder_latent_token_type_embed': False,
+#         'use_decoder_patch_query_token_type_embed': True,
+#         'encoder_query_gaussian_init': True,
+#         'latent_pe_scale_factor': 10000,
+#         'query_init_std': 0.02
+#     }
+
+#     # 2. Instantiate Model
+#     print("Initializing LARPTokenizer...")
+#     model = LARPTokenizer(**config)
+    
+#     # 3. Create dummy input: (Batch, Channels, Time, Height, Width)
+#     dummy_input = torch.randn(1, 3, frame_num, input_size, input_size)
+#     print(f"Input shape: {dummy_input.shape}")
+
+#     # 4. Run Forward
+#     print("Running forward pass...")
+#     output = model(dummy_input)
+
+#     # 5. Assertions and Checks
+#     pred_frames = output['pred_frames']
+#     print(f"Prediction shape: {pred_frames.shape}")
+    
+#     # Check 1: Input/Output Resolution match
+#     assert pred_frames.shape == dummy_input.shape, \
+#         f"Shape mismatch! Input {dummy_input.shape}, Output {pred_frames.shape}"
+    
+#     # Check 2: Bottleneck Token Count
+#     encoded_z = output['encoded'] # Should be (B, N, D)
+#     print(f"Encoded shape: {encoded_z.shape}")
+#     assert encoded_z.shape[1] == config['bottleneck_token_num'], \
+#         f"Expected {config['bottleneck_token_num']} tokens, got {encoded_z.shape[1]}"
+
+#     # Check 3: Check Codebook Indices
+#     indices = output['bottleneck_rep']
+#     print(f"Codebook indices shape: {indices.shape}")
+#     assert indices.shape == (1, config['bottleneck_token_num'])
+
+#     print("\n✅ Test Passed: LARPTokenizer initialized and ran successfully with provided config.")
+
+# if __name__ == "__main__":
+#     test_larp_tokenizer()

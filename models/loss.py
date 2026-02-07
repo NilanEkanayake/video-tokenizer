@@ -216,7 +216,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
         disc_factor=1.0,
         disc_weight=1.0,
         perceptual_weight=1.0,
-        disc_loss="ns_smooth",
+        disc_loss="hing",
         disc_tran_hidden_size=256,
         disc_tran_n_heads=8,
         disc_tran_n_layers=6,
@@ -345,7 +345,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
     ):  
         input_frames = rearrange(inputs, 'b c t h w -> (b t) c h w').contiguous()
         reconstruction_frames = rearrange(reconstructions, 'b c t h w -> (b t) c h w').contiguous()
-
+        B = inputs.shape[0]
         if self.disc_type == '2d':
             input_to_disc = input_frames
             recon_to_disc = reconstruction_frames
@@ -367,9 +367,13 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 rec_loss = input_frames.new_zeros(1)
 
             if self.perceptual_weight > 0:
-                p_loss = self.perceptual_loss(
+                # p_loss = self.perceptual_loss(
+                #     input_frames, reconstruction_frames, normalize=True
+                # )
+                p_loss_raw = self.perceptual_loss(
                     input_frames, reconstruction_frames, normalize=True
                 )
+                p_loss = torch.mean(p_loss_raw) # 用于优化的标量 Loss
             else:
                 p_loss = input_frames.new_zeros(1)
 
@@ -392,7 +396,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 g_loss_weight = g_loss_weight.item()
 
             loss = nll_loss + g_loss_weight * g_loss
-
+            p_loss_per_sample = p_loss_raw.view(B, -1).mean(dim=1)
             info_dict = {
                 'rec_loss': rec_loss.mean().item(),
                 'perceptual_loss': p_loss.mean().item(),
@@ -401,7 +405,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 'g_loss_weight': g_loss_weight,
             }
 
-            return loss, info_dict
+            return loss, info_dict, p_loss_per_sample
 
         else: # for_discriminator == True, discriminator update
             disc_factor = adopt_weight(
@@ -449,4 +453,4 @@ class VQLPIPSWithDiscriminator(nn.Module):
             if self.r1_gp_weight > 0.0:
                 info_dict['r1_gp'] = r1_gp.item()
 
-            return total_loss, info_dict
+            return total_loss, info_dict,None

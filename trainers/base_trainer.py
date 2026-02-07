@@ -385,7 +385,7 @@ class BaseTrainer():
             model_compiled = model
 
         if self.distributed:
-            model_ddp = DistributedDataParallel(model_compiled, device_ids=[self.rank])
+            model_ddp = DistributedDataParallel(model_compiled, device_ids=[self.rank],find_unused_parameters=True)  #decode
         else:
             model_ddp = model_compiled
 

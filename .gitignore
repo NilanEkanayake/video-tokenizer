@@ -115,3 +115,7 @@ save/*
 tmp/*
 tmp*
 samples/*
+/save
+/basic_autoencoder
+/basic_autoencoder_origin
+/TiTok-Video

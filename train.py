@@ -28,7 +28,7 @@ def parse_args(args=None):
     parser.add_argument('--input_size', type=int, default=128)
     parser.add_argument('--batch_size', '-b', type=int, default=16)
     parser.add_argument('--num_workers', '-j', type=int, default=16)
-    parser.add_argument('--out_path', type=str, default='default')
+    parser.add_argument('--out_path', type=str, default='default')                          #17
     parser.add_argument('--name', '-n', default=None)
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--cudnn', action='store_true')
@@ -119,6 +119,7 @@ def make_cfg(args):
     assert len(args.opts) % 2 == 0
     for cur_cfg_key, v in zip(args.opts[::2], args.opts[1::2]):
         keys = cur_cfg_key.split('.')
+        print('Overriding cfg: ', keys, '->', v)
         v = convert(type(nested_v(cfg, keys)), v)
         cfg = merge(cfg, build_tree(keys + [v]))
 

@@ -9,11 +9,14 @@ import torch
 
 from eval.rfvd_evaluator import UCFrFVDEvaluator
 from models.larp_tokenizer import LARPTokenizer
+import sys
+import os
+
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tokenizer', type=str, required=True)
+    parser.add_argument('--tokenizer', type=str, default='/data2/zhxie/myproject/LARP/save/larp_tokenizer0106/larp_tokenizer/b16_btn1024_vq_rcs8192__default/best_fvd_254.25.pth')
     parser.add_argument('--dataset_csv', type=str, default='ucf101_train.csv')
     parser.add_argument('--num_frames', type=int, default=16)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -29,7 +32,6 @@ def get_args():
 
 def main(args):
     assert args.tokenizer is not None
-
     if os.path.exists(args.tokenizer):
         # Load tokenizer from local checkpoint
         model = LARPTokenizer.from_checkpoint(args.tokenizer)

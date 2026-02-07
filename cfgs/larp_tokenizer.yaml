@@ -1,4 +1,4 @@
-trainer: larp_tokenizer_trainer
+trainer: larp_tokenizer_trainer_stat
 
 train_dataset:
   name: video_dataset
@@ -34,7 +34,7 @@ test_dataset:
     num_workers: $num_workers$
 
 model:
-  name: larp_tokenizer
+  name: autoencoder_stat
   args:
     bottleneck:
       name: bottleneck
@@ -54,7 +54,7 @@ model:
             stochastic_temperature: 0.03
 
     prior_model:
-      name: gptc-S
+      name: none
       use_mix_ss: true
       mix_ss_max_ratio: 0.5
       mix_ss_peak_steps_ratio: 0.3
@@ -66,23 +66,32 @@ model:
       args: 
         l2_normalized: true
 
-    transformer_name: 'transformer_encoder_parallel'
-    encoder_name: 'none'
-    decoder_name: 'none'
-    bottleneck_token_num: 1024
-    input_size: $input_size$
-    frame_num: $frame_num$
-    temporal_patch_size: 4
+    # --- Cosmos Specific Configurations ---
+    # token_num_first: 512
+    # token_num_rest: 512
+    bottleneck_token_num: 1024  # 128 + 256
+    
+    # --- Dimensions ---
+    input_size: 128            # 根据测试代码设定          17
+    frame_num: $frame_num$             # 1 (First) + 16 (Rest)
+    
+    # --- Patch Sizes ---
+    temporal_patch_size: 4     # 仅作用于后续帧
     patch_size: 8
     decoder_temporal_patch_size: 4
     decoder_patch_size: 8
     in_channels: 3
+
+    # --- Transformer Architecture ---
+    transformer_name: 'transformer_encoder_parallel'
+    encoder_name: 'none'
+    decoder_name: 'none'
     encoder_hidden_size: 768
     decoder_hidden_size: 768
     encoder_num_heads: 12
     decoder_num_heads: 12
-    encoder_depth: 12
-    decoder_depth: 12
+    encoder_depth: 6           # 根据测试代码设定为 6
+    decoder_depth: 6           # 根据测试代码设定为 6
 
     learned_encoder_patch_pe: false
     learned_encoder_latent_query_embed: true
@@ -95,25 +104,24 @@ model:
     use_decoder_patch_query_token_type_embed: true
 
     encoder_query_gaussian_init: true
-
     latent_pe_scale_factor: 10000
     query_init_std: 0.02
     
     
 loss:
   name: lpips_disc_loss
-  args:
+  args:     #num_latent_tokens
     disc_type: 'transformer'
     disc_start: 0
     disc_self_start: -1
     pixelloss_weight: 1.0
     perceptual_weight: 1.0
-    pixel_loss: 'l1'
+    pixel_loss: 'l2'
     perceptual_loss: 'lpips'
     perceptual_fp16: false
     lecam_weight: 0.001
     disc_loss: 'ns_smooth'
-    disc_weight: 0.3
+    disc_weight: 0.2
     r1_gp_weight: 0.0
     d_update_freq: 5
     spectral_norm: false

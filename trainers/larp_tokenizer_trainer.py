@@ -44,7 +44,7 @@ class LARPTokenizerTrainer(BaseTrainer):
         self.base_kl_weight = float(self.cfg['loss_kl_weight'])
 
         sqt_start_end_epoch = cfg.get('sqt_start_end_epoch', '0.0_0.0_0')
-        sqt_start, sqt_end, sqt_epoch = sqt_start_end_epoch.split('_')  # start, end, epoch
+        sqt_start, sqt_end, sqt_epoch = sqt_start_end_epoch.split('_')  # start, end, epoch    decode     17
         self.sqt_start = float(sqt_start)
         self.sqt_end = float(sqt_end)
         self.sqt_epoch = int(sqt_epoch)
@@ -234,18 +234,18 @@ class LARPTokenizerTrainer(BaseTrainer):
         data = data['gt'].to(self.device) 
         B = data.shape[0]
 
-        if self.set_sqt_every_step:
-            sqt_weight = self.get_sqt_weight()
-            self.orig_model.bottleneck.regularizer.set_stochastic_temperature(sqt_weight)
-        else:
-            sqt_weight = self.orig_model.bottleneck.regularizer.default_stochastic_temperature 
-
+        # if self.set_sqt_every_step:
+        #     sqt_weight = self.get_sqt_weight()
+        #     self.orig_model.bottleneck.regularizer.set_stochastic_temperature(sqt_weight)
+        # else:
+        #     sqt_weight = self.orig_model.bottleneck.regularizer.default_stochastic_temperature 
+        sqt_weight=0
         # generate fake frames
         with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
             model_output = self.model_ddp(
-                data=data,
-                global_step=self.global_step,
-                max_steps=self.max_steps,
+                data,
+                # global_step=self.global_step,
+                # max_steps=self.max_steps,
             )
             assert isinstance(model_output, dict)
             pred_frames = model_output['pred_frames']
@@ -297,7 +297,7 @@ class LARPTokenizerTrainer(BaseTrainer):
                 pred_frames,
                 global_step=self.epoch, 
                 for_discriminator=False, 
-                last_layer=self.model.get_last_layer()
+                last_layer=None
             )
 
             info_dict.update(g_info_dict)
@@ -431,8 +431,9 @@ class LARPTokenizerTrainer(BaseTrainer):
             wandb.log({tag: wandb.Video(res*255., format='mp4')}, step=self.epoch)
 
     def visualize_epoch(self):
-        if hasattr(self, 'vislist_train'):
-            self._gen_vis_result('vis_train_dataset', self.vislist_train)
-        if hasattr(self, 'vislist_test'):
-            self._gen_vis_result('vis_test_dataset', self.vislist_test)
+        pass
+        # if hasattr(self, 'vislist_train'):
+        #     self._gen_vis_result('vis_train_dataset', self.vislist_train)
+        # if hasattr(self, 'vislist_test'):
+        #     self._gen_vis_result('vis_test_dataset', self.vislist_test)
 
