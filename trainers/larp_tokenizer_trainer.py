@@ -268,7 +268,7 @@ class LARPTokenizerTrainer(BaseTrainer):
 
             pred_frames_detached = pred_frames.detach()
             with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-                disc_loss, disc_info_dict = self.loss_ddp( 
+                disc_loss, disc_info_dict,_ = self.loss_ddp( 
                     data, 
                     pred_frames_detached,
                     global_step=self.epoch,
@@ -292,7 +292,7 @@ class LARPTokenizerTrainer(BaseTrainer):
         self.loss.trainable_requires_grad_(False)
 
         with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-            loss_obj, g_info_dict = self.loss( 
+            loss_obj, g_info_dict,_ = self.loss( 
                 data, 
                 pred_frames,
                 global_step=self.epoch, 

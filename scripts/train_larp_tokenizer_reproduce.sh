@@ -2,10 +2,10 @@
 # It can reproduce the pretrained model hywang66/LARP-L-long-tokenizer released on HuggingFace.
 
 python3 \
-    train.py --cfg cfgs/larp_tokenizer.yaml \
+    train.py --cfg cfgs/larp_tokenizer_stat.yaml \
     --manualSeed 66667 --tag default \
-    --csv_file ucf101_train.csv --out_path save/larp_tokenizer0207ccc/ \
-    --name larp_tokenizer -b 32 -j 32 \
+    --csv_file ucf101_train.csv --out_path save/larp_tokenizer0209fuck1/ \
+    --name larp_tokenizer -b 16 -j 16 \
     --frame_num 16 --input_size 128   \
     --opts \
     test_dataset.csv_paths.ucf101_val ucf101_val.csv \

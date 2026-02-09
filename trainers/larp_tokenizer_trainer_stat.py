@@ -17,7 +17,7 @@ from trainers import register
 
 from .base_trainer import BaseTrainer
 
-
+import random
 optimizer_dict = {
     'sgd': SGD,
     'adam': Adam,
@@ -28,75 +28,109 @@ optimizer_dict = {
 class STATLoss(nn.Module):
     def __init__(self, 
                  target_sparsity=0.7, # 目标平均保留比例
-                 lambda_content=10.0,  # 内容自适应 Loss 权重
-                 lambda_decrease=1.0, # 单调递减 Loss 权重
-                 lambda_sparse=0.5    # 稀疏性 Loss 权重
+                 lambda_content=0.1,  # 内容自适应 Loss 权重
+                 lambda_decrease=0.01, # 单调递减 Loss 权重
+                 lambda_sparse=0.005    # 稀疏性 Loss 权重
                  ):
         super().__init__()
-        self.target_sparsity = target_sparsity
+        self.target_sparsity = random.uniform(0.85, 0.99) 
         self.lambda_content = lambda_content
         self.lambda_decrease = lambda_decrease
         self.lambda_sparse = lambda_sparse
 
-    def compute_correlation(self, x, y):
-        """计算两个向量 x 和 y 的皮尔逊相关系数"""
-        vx = x - torch.mean(x)
-        vy = y - torch.mean(y)
-        cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
-        return cost
+    # def compute_correlation(self, x, y):
+    #     """计算两个向量 x 和 y 的皮尔逊相关系数"""
+    #     vx = x - torch.mean(x)
+    #     vy = y - torch.mean(y)
+    #     cost = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+    #     return cost
 
     def forward(self, probs, lpips_scores):
-        """
-        probs: [B, N, 1] - 模型预测的保留概率
-        lpips_scores: [B] - 当前 Batch 中每张图/视频的 LPIPS 重建误差 (Ground Truth vs Reconstruction)
-        """
-        #print(f"STATLoss: probs shape={probs.shape}, lpips_scores shape={lpips_scores.shape}")
-        #print(lpips_scores)
-        B, N, _ = probs.shape
-        probs = probs.squeeze(-1) # [B, N]
+        self.target_sparsity = random.uniform(0.85, 0.99) 
+        # """
+        # probs: [B, N, 1] - 模型预测的保留概率
+        # lpips_scores: [B] - 当前 Batch 中每张图/视频的 LPIPS 重建误差 (Ground Truth vs Reconstruction)
+        # """
+        # #print(f"STATLoss: probs shape={probs.shape}, lpips_scores shape={lpips_scores.shape}")
+        # #print(lpips_scores)
+        # B, N, _ = probs.shape
+        # probs = probs.squeeze(-1) # [B, N]
+        # #print(f"Probs: {probs}")
         
-        # 1. 计算期望 Token 数量 (Expected Token Count)
-        # T_expected = sum(probs) per sample
-        expected_token_counts = probs.sum(dim=1) # [B]
+        # # 1. 计算期望 Token 数量 (Expected Token Count)
+        # # T_expected = sum(probs) per sample
+        # expected_token_counts = probs.sum(dim=1) # [B]
+        # print(f"Expected token counts: {expected_token_counts}")
         
-        # --- Loss 1: Content-Adaptive Prior (内容自适应先验) ---
-        # 目标：让 Expected Token Count 与 LPIPS Score 正相关
-        # 如果 LPIPS 高 (重建难)，Token 数应该多。
-        # 我们最大化相关性 -> 最小化 (1 - Correlation)^2
+        # # --- Loss 1: Content-Adaptive Prior (内容自适应先验) ---
+        # # 目标：让 Expected Token Count 与 LPIPS Score 正相关
+        # # 如果 LPIPS 高 (重建难)，Token 数应该多。
+        # # 我们最大化相关性 -> 最小化 (1 - Correlation)^2
         
-        # 归一化 LPIPS scores (可选，有助于稳定训练)
+        # # 归一化 LPIPS scores (可选，有助于稳定训练)
         # lpips_norm = (lpips_scores - lpips_scores.mean()) / (lpips_scores.std() + 1e-8)
         
-        correlation = self.compute_correlation(expected_token_counts, lpips_scores.detach())
-        loss_content = (1 - correlation) ** 2
+        # correlation = self.compute_correlation(expected_token_counts, lpips_norm.detach())
+        # loss_content = (1 - correlation) ** 2
         
-        # --- Loss 2: Decreasing Importance Prior (单调递减先验) ---
-        # 目标：probs[i] >= probs[i+1]
-        # 惩罚所有 probs[i+1] > probs[i] 的情况
-        # calculate diff: p[i+1] - p[i]
+        # # --- Loss 2: Decreasing Importance Prior (单调递减先验) ---
+        # # 目标：probs[i] >= probs[i+1]
+        # # 惩罚所有 probs[i+1] > probs[i] 的情况
+        # # calculate diff: p[i+1] - p[i]
+        # diff = probs[:, 1:] - probs[:, :-1] # [B, N-1]
+        # # 我们只惩罚正值 (即后面比前面大的情况)
+        # loss_decrease = torch.sum(torch.relu(diff)) / B
+        
+        # # --- Loss 3: Sparsity Prior (稀疏性/压缩率先验) ---
+        # # 目标：整个 Batch 的平均保留率接近 target_sparsity
+        # avg_prob = probs.mean()
+        # print(f"Average prob: {avg_prob.item():.4f}, Target sparsity: {self.target_sparsity}")
+        # # 使用 KL 散度或者简单的 MSE
+        # # Paper 中使用的是 Binary KL divergence, 这里用简单的 MSE 演示，效果通常类似
+        # loss_sparse = (avg_prob - self.target_sparsity) ** 2
+        B = probs.shape[0]
+        probs = probs.view(B, -1)
+        with torch.autocast(enabled=False, device_type=probs.device.type): # loss calcs are untested
+            s_probs = probs.mean(-1) # [B]
+            corr_matrix = torch.corrcoef(torch.stack((lpips_scores.clone().detach().float(), s_probs.float()))) # detach needed?
+            content_loss = 1.0 - (corr_matrix[0, 1] ** 2).to(s_probs).mean()
+
+        #sparsity_loss = F.binary_cross_entropy(s_probs, torch.full_like(s_probs, self.target_sparsity), reduction='mean')
+        sample_avg_prob = probs.mean(dim=1) # [B]
+        
+        # 使用 MSE Loss
+        sparsity_loss = F.mse_loss(
+            sample_avg_prob, 
+            torch.full_like(sample_avg_prob, self.target_sparsity)
+        )
+
         diff = probs[:, 1:] - probs[:, :-1] # [B, N-1]
-        # 我们只惩罚正值 (即后面比前面大的情况)
-        loss_decrease = torch.sum(torch.relu(diff)) / B
-        
-        # --- Loss 3: Sparsity Prior (稀疏性/压缩率先验) ---
-        # 目标：整个 Batch 的平均保留率接近 target_sparsity
-        avg_prob = probs.mean()
-        # 使用 KL 散度或者简单的 MSE
-        # Paper 中使用的是 Binary KL divergence, 这里用简单的 MSE 演示，效果通常类似
-        loss_sparse = (avg_prob - self.target_sparsity) ** 2
-        
+        loss_decrease = torch.relu(diff).mean()
+
+
+
         # 总 Loss
         total_stat_loss = (
-            self.lambda_content * loss_content +
+            self.lambda_content * content_loss +
             self.lambda_decrease * loss_decrease +
-            self.lambda_sparse * loss_sparse
+            self.lambda_sparse * sparsity_loss
         )
+        prob_var = probs.var(dim=1).mean()  # 每个样本内probs的方差
+        # 目标方差：如果target_sparsity=0.5，理想的均匀分布方差约0.083
+        # 我们用一个简单的损失鼓励方差不要太小
+        diversity_loss = 1.0 / (prob_var + 1e-4)  # 方差越大loss越小
+        # 归一化到合理范围
+        diversity_loss = diversity_loss * 0.0005
+        total_loss = total_stat_loss +  diversity_loss
+        #print(f"STATLoss: loss_content={loss_content.item():.4f}, loss_decrease={loss_decrease.item():.4f}, loss_sparse={loss_sparse.item():.4f}, diversity_loss={diversity_loss.item():.4f}, total_loss={total_loss.item():.4f}")
+
         
-        return total_stat_loss, {
-            "loss_content": loss_content.item(),
+        return total_loss, {
+            "loss_content": content_loss.item(),
             "loss_decrease": loss_decrease.item(),
-            "loss_sparse": loss_sparse.item(),
-            "avg_tokens": expected_token_counts.mean().item()
+            "loss_sparse": sparsity_loss.item(),
+            "avg_tokens": (probs > 0.5).float().sum(-1).mean().item(),
+            'diversity_loss': diversity_loss.item(),
         }
 
 
@@ -408,7 +442,7 @@ class LARPTokenizerTrainer(BaseTrainer):
                 probs = model_output['probs']
                 # 这里的 lpips_per_sample 就是我们需要的 "Batch LPIPS"
                 loss_stat, stat_logs = self.stat_loss_fn(probs, lpips_per_sample.detach())
-                loss = loss + loss_stat 
+                loss = loss + 0.1*loss_stat 
                 info_dict.update(stat_logs)
 
 

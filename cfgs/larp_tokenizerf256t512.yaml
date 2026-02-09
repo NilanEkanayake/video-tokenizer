@@ -34,7 +34,7 @@ test_dataset:
     num_workers: $num_workers$
 
 model:
-  name: autoencoder_baseline
+  name: autoencoder_first_token_f256t512
   args:
     bottleneck:
       name: bottleneck

@@ -49,7 +49,7 @@ class AutoEncoder(nn.Module):
         token_size = 6
 
         self.encoder = Encoder(
-            model_size='small',
+            model_size='base_thin',
             patch_size=[4, 8, 8],
             in_channels=3,
             out_channels=token_size,
@@ -58,7 +58,7 @@ class AutoEncoder(nn.Module):
         )
         self.quantize = FSQ(levels=[8, 8,8, 5, 5, 5])
         self.decoder = Decoder(
-            model_size='small',
+            model_size='base_thin',
             patch_size=[4, 8, 8],
             in_channels=token_size,
             out_channels=3,
@@ -73,25 +73,25 @@ class AutoEncoder(nn.Module):
         反向传播：梯度直接传给 probs。
         """
         if self.training:
-            # 伯努利采样
-            # 生成 [0, 1] 均匀分布随机数
-            noise = torch.rand_like(probs)
-            # 比较生成 mask: noise < probs -> 1 (Keep), else 0 (Drop)
-            mask = (noise < probs).float()
-            # STE 技巧: (mask - probs).detach() + probs
-            # 前向值: mask
-            # 梯度: d(probs)
-            mask_ste = (mask - probs).detach() + probs
+            # # 伯努利采样
+            # # 生成 [0, 1] 均匀分布随机数
+            # noise = torch.rand_like(probs)
+            # # 比较生成 mask: noise < probs -> 1 (Keep), else 0 (Drop)
+            # mask = (noise < probs).float()
+            # # STE 技巧: (mask - probs).detach() + probs
+            # # 前向值: mask
+            # # 梯度: d(probs)
+            # mask_ste = (mask - probs).detach() + probs
+            mask = torch.bernoulli(probs)
+            mask = (mask - probs).detach() + probs
         else:
-            # 推理阶段：通常使用阈值截断 (例如 0.5) 或者保留所有直到 EoS
-            # 这里简单演示阈值截断，STAT 论文中推理时也可以使用动态截断
-            mask_ste = (probs >= 0.5).float()
-        return mask_ste
+            mask = (probs > 0.5).to(probs)
+        return mask
 
     def get_stage(self, current_epoch):
-            if current_epoch < 10:
+            if current_epoch < 0:
                 return "vanilla"  # 阶段 1: 全量训练
-            elif current_epoch < 20:
+            elif current_epoch < 0:
                 return "random_drop" # 阶段 2: 随机截断
             else:
                 return "adaptive" # 阶段 3: 概率预测 (STAT)
@@ -101,8 +101,8 @@ class AutoEncoder(nn.Module):
         x, probs = self.encoder(data)
         B, N, _ = x.shape
         stage = self.get_stage(current_epoch)
-        mask = torch.ones_like(probs).to(x.device) # 默认全 1 (全保留)
-
+        #mask = torch.ones_like(probs).to(x.device) # 默认全 1 (全保留)
+        mask = torch.ones_like(probs).to(x) # 默认全 1 (全保留)
         if self.training:
             if stage == "vanilla":
                 pass 
@@ -112,18 +112,20 @@ class AutoEncoder(nn.Module):
                 max_keep = 1024
                 K = torch.randint(min_keep, max_keep + 1, (B,), device=x.device)
                 seq_idx = torch.arange(N, device=x.device).unsqueeze(0) # [1, N]
-                mask = (seq_idx < K.unsqueeze(1)).float().unsqueeze(-1) # [B, N, 1]
+                #mask = (seq_idx < K.unsqueeze(1)).float().unsqueeze(-1) # [B, N, 1]
+                mask = (seq_idx < K.unsqueeze(1)).float()
                 
             elif stage == "adaptive":
                 mask = self.get_mask_with_ste(probs)
         else:
             if stage == "adaptive":
-                 mask = (probs >= 0.5).float()
+                 #mask = (probs >= 0.5).float()
+                 mask = (probs > 0.5).to(x)
             else:
                  pass # 全量重建
         # 应用 Mask 到量化前的特征
-        x_masked = x * mask
-        
+        #x_masked = x * mask
+        x_masked = x * mask.to(x).unsqueeze(-1)
         # 量化
         x_q, x_dict = self.quantize(x_masked)
         

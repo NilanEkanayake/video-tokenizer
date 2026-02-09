@@ -8,20 +8,34 @@ from models.model_new.base.rope import get_freqs
 from einops.layers.torch import Rearrange
 from einops import rearrange
 import math
-
 class ProbPredictor(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        # 一个简单的 MLP： Linear -> GELU -> Linear -> Sigmoid
         self.net = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, 1),
-            nn.Sigmoid()
+            # 移除这里的 Sigmoid，放到 forward 里或者最后
         )
 
+        self.sigmoid = nn.Sigmoid()
+
     def forward(self, x):
-        return self.net(x)      
+        return self.sigmoid(self.net(x))
+
+# class ProbPredictor(nn.Module):
+#     def __init__(self, embed_dim):
+#         super().__init__()
+#         # 一个简单的 MLP： Linear -> GELU -> Linear -> Sigmoid
+#         self.net = nn.Sequential(
+#             nn.Linear(embed_dim, embed_dim),
+#             nn.GELU(),
+#             nn.Linear(embed_dim, 1),
+#             nn.Sigmoid()
+#         )
+
+#     def forward(self, x):
+#         return self.net(x)      
     
 class Encoder(nn.Module):
     def __init__(
@@ -72,9 +86,11 @@ class Encoder(nn.Module):
         x = self.model_layers(x, freqs=self.freqs.to(device))
 
         x = x[:, :self.out_tokens]
-        probs = self.prob_head(x)
+        x_for_prob = x.detach() + 0.1 * (x - x.detach())  # STE风格，缩放梯度
+        probs = self.prob_head(x_for_prob)
+        #probs = self.prob_head(x)
         x = self.proj_out(x)
-        return x,probs
+        return x, probs.view(B, self.out_tokens)
 
 
 class Decoder(nn.Module):
