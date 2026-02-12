@@ -113,3 +113,30 @@ def get_freqs(in_tokens=2048, in_grid=[16, 64, 64], head_dim=64, theta=10000.0):
 
     # return torch.cat(result, dim=-1)
     return interleave_freqs(result)
+
+
+def get_freqs_multi(in_seqs=[[512, [4, 64, 64]], [1536, [12, 64, 64]]], head_dim=64, theta=10000.0):
+    # in_seqs is a list of paired 1D and 3D sizes (should be in a logically sequential order, eg, temporally with respective 1D token assigned)
+    # output is a list of freqs, to be assigned to their respective (flattened) token sequences.
+    grid_dims = len(in_seqs[0][1])
+    axes_dim = head_dim/grid_dims
+    axes_dim = [int(axes_dim - (axes_dim % 2))] * grid_dims
+    axes_dim[0] += head_dim - sum(axes_dim) # add remainder to T dim
+
+    rope_grid = []
+    splits = []
+    for i, seq in enumerate(in_seqs):
+        # [1D, 3D]
+        tmp_grid = get_grid(seq[0], seq[1])
+        if i > 0:
+            tmp_grid = tmp_grid + rope_grid[i-1].max() # + 1 extra? | add offset
+        rope_grid.append(tmp_grid)
+        splits.append(tmp_grid.shape[0])
+    rope_grid = torch.cat(rope_grid, dim=0) # cat along L
+
+    result = []
+    for i in range(len(axes_dim)):
+        freqs = get_1d_rotary_pos_embed(axes_dim[i], rope_grid[:, i], theta=theta)
+        result.append(freqs)
+
+    return torch.split(interleave_freqs(result), splits, dim=0)
