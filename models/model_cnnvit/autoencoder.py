@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
-from models.model_new.base.blocks import Encoder, Decoder ,Decoder_unify
-from models.model_new.quantizer.fsq import FSQ
+from models.model_cnnvit.base.blocks import Encoder, Decoder ,Decoder_unify
+from models.model_cnnvit.quantizer.fsq import FSQ
 from models import register
 
 
-@register('autoencoder_baseline')
+@register('autoencoder_cnnvit')
 class AutoEncoder(nn.Module):
     def __init__(self, 
         bottleneck,
@@ -49,7 +49,7 @@ class AutoEncoder(nn.Module):
         token_size = 6
 
         self.encoder = Encoder(
-            model_size='small',
+            model_size='small_thin',
             patch_size=[4, 8, 8],
             in_channels=3,
             out_channels=token_size,
@@ -58,7 +58,7 @@ class AutoEncoder(nn.Module):
         )
         self.quantize = FSQ(levels=[8, 8,8, 5, 5, 5])
         self.decoder = Decoder(
-            model_size='small',
+            model_size='small_thin',
             patch_size=[4, 8, 8],
             in_channels=token_size,
             out_channels=3,

@@ -49,20 +49,20 @@ class AutoEncoder(nn.Module):
         token_size = 6
 
         self.encoder = Encoder(
-            model_size='base_thin',
+            model_size='base',
             patch_size=[4, 8, 8],
             in_channels=3,
             out_channels=token_size,
             in_grid=in_grid,
-            out_tokens=1024,
+            out_tokens=1280,
         )
         self.quantize = FSQ(levels=[8, 8,8, 5, 5, 5])
         self.decoder = Decoder(
-            model_size='base_thin',
+            model_size='base',
             patch_size=[4, 8, 8],
             in_channels=token_size,
             out_channels=3,
-            in_tokens=1024,
+            in_tokens=1280,
             out_grid=in_grid,
         )
         self.prior_model = None 

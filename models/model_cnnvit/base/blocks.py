@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.model_new.base.transformer import ResidualAttentionBlock
-from models.model_new.base.utils import get_model_dims, init_weights
-from models.model_new.base.rope import get_freqs
-
+from models.model_cnnvit.base.transformer import ResidualAttentionBlock
+from models.model_cnnvit.base.utils import get_model_dims, init_weights
+from models.model_cnnvit.base.rope import get_freqs
+from models.model_cnnvit.base.cnnvit import Encoder_cnn, Decoder_cnn
 from einops.layers.torch import Rearrange
 from einops import rearrange
 import math
@@ -35,12 +35,18 @@ class Encoder(nn.Module):
         scale = self.width ** -0.5
 
         # ========== 改动：Linear → Conv3d ==========
-        self.proj_in = nn.Conv3d(
-            in_channels=in_channels,
-            out_channels=self.width,
-            kernel_size=patch_size,
-            stride=patch_size,
-            bias=True,
+        # self.proj_in = nn.Conv3d(
+        #     in_channels=in_channels,
+        #     out_channels=self.width,
+        #     kernel_size=patch_size,
+        #     stride=patch_size,
+        #     bias=True,
+        # )
+        self.cnn_encoder = Encoder_cnn(
+            in_channels=3, 
+            ch=32, 
+            ch_mult=(1, 2, 4, 4), # 产生 T/4, H/8, W/8
+            z_channels=self.width # 确保 CNN 输出通道等于 Transformer 宽度
         )
         # ============================================
 
@@ -64,7 +70,7 @@ class Encoder(nn.Module):
 
         # ========== 改动：Conv3d patchify ==========
         # [B, C, T, H, W] → [B, width, T', H', W']
-        x = self.proj_in(x)
+        x = self.cnn_encoder(x)
         # [B, width, T', H', W'] → [B, T'*H'*W', width]
         x = rearrange(x, 'b c t h w -> b (t h w) c')
         # ============================================
@@ -111,12 +117,11 @@ class Decoder(nn.Module):
         )
 
         # ========== 改动：Linear → ConvTranspose3d ==========
-        self.proj_out = nn.ConvTranspose3d(
-            in_channels=self.width,
-            out_channels=out_channels,
-            kernel_size=patch_size,
-            stride=patch_size,
-            bias=True,
+        self.cnn_decoder = Decoder_cnn(
+            z_channels=self.width,
+            ch=32,
+            ch_mult=(1, 2, 4, 4),
+            out_channels=3
         )
         # =====================================================
 
@@ -143,7 +148,7 @@ class Decoder(nn.Module):
             t=self.grid[0], h=self.grid[1], w=self.grid[2],
         )
         # [B, width, T', H', W'] → [B, out_channels, T, H, W]
-        x = self.proj_out(x)
+        x = self.cnn_decoder(x)
         # =====================================================
 
         return x

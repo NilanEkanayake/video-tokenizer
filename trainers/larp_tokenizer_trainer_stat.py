@@ -30,7 +30,7 @@ class STATLoss(nn.Module):
                  target_sparsity=0.7, # 目标平均保留比例
                  lambda_content=0.1,  # 内容自适应 Loss 权重
                  lambda_decrease=0.01, # 单调递减 Loss 权重
-                 lambda_sparse=0.005    # 稀疏性 Loss 权重
+                 lambda_sparse=0.01    # 稀疏性 Loss 权重
                  ):
         super().__init__()
         self.target_sparsity = random.uniform(0.85, 0.99) 
@@ -94,7 +94,8 @@ class STATLoss(nn.Module):
             s_probs = probs.mean(-1) # [B]
             corr_matrix = torch.corrcoef(torch.stack((lpips_scores.clone().detach().float(), s_probs.float()))) # detach needed?
             content_loss = 1.0 - (corr_matrix[0, 1] ** 2).to(s_probs).mean()
-
+            if torch.isnan(content_loss):
+                 content_loss = torch.tensor(0.0, device=probs.device)
         #sparsity_loss = F.binary_cross_entropy(s_probs, torch.full_like(s_probs, self.target_sparsity), reduction='mean')
         sample_avg_prob = probs.mean(dim=1) # [B]
         
@@ -123,7 +124,7 @@ class STATLoss(nn.Module):
         diversity_loss = diversity_loss * 0.0005
         total_loss = total_stat_loss +  diversity_loss
         #print(f"STATLoss: loss_content={loss_content.item():.4f}, loss_decrease={loss_decrease.item():.4f}, loss_sparse={loss_sparse.item():.4f}, diversity_loss={diversity_loss.item():.4f}, total_loss={total_loss.item():.4f}")
-
+        #print(f"STATLoss: content_loss={content_loss.item():.4f}, loss_decrease={loss_decrease.item():.4f}, sparsity_loss={sparsity_loss.item():.4f}, diversity_loss={diversity_loss.item():.4f}, total_stat_loss={total_stat_loss.item():.4f}, total_loss={total_loss.item():.4f}")
         
         return total_loss, {
             "loss_content": content_loss.item(),

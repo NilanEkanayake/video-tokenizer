@@ -8,6 +8,9 @@ from . import larp_tokenizer
 from .model import autoencoder
 from .model_titok import titok
 from .model_new import autoencoder as autoencoder_new
+from .model_design import autoencoder as autoencoder_design
 from .model_stat import autoencoder as autoencoder_stat
+from .model_dualpatch import autoencoder as autoencoder_dualpatch
+from .model_cnnvit import autoencoder as autoencoder_cnnvit
 def get_model_cls(name):
     return models[name]
